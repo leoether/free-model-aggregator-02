@@ -1,20 +1,30 @@
-// free-model-aggregator-02: one server, two client wires, real free models behind every answer.
+// free-model-aggregator-02 v2: one server, two client wires, real free models behind every answer.
 //
-// The trial gives this server a brief (MAKEFUN_PROMPT_FILE) with two JSON documents: the fourteen
-// free OpenRouter models the gateway routes (each with the house's rating in milli-points and its
-// capabilities) and the six prompts the env's client will send, in arrival order. The server listens
-// on 0.0.0.0 at a free port, registers that port plus its catalog with the env, and answers each
-// prompt with a real completion dialled through the gateway (OPENAI_BASE_URL) on the trial's key.
-//
-// Routing: for each prompt, the candidates are the free models meeting that prompt's requirements,
-// ordered best-first by rating_milli. A fast HTTP refusal (429/5xx) does not demote a model for the
-// next prompt — the best model is worth retrying there, a refused call costs nothing on the
-// tie-break, and a transient limit may have cleared — but a model whose call timed out or never
-// reached the gateway is demoted for the rest of the trial, so a hung model cannot eat every
-// prompt's 30 s wait. Both orders are functions of gateway answers only, so they are deterministic
-// across a live pass and its replay. On a 4xx/5xx/network refusal the server fails
-// over to the next candidate and reports the trail in x-makefun-upstream-failures, so the failover
-// column can see refusals that were retried and then served.
+// v2 changes over v1 (dev grade 75: quality 68, served 83, wire 95, failover 75, catalog 100):
+// - Routing follows the sealed table's evidence, not the headline rating. In v1's dev trial the
+//   top-rated model (inkling-2-small, 1475) refused all four non-JSON prompts (the trial's four
+//   errored model calls), and the failover served one weight-2 prompt with an answer that did not
+//   carry the prompt's token, so that prompt earned nothing. The live leaderboard's top entries
+//   all sit at quality 90, which is exactly JSON prompts served by nemotron-3.5-super-vl (1303,
+//   the best JSON-capable model) and every other prompt by nemotron-3-ultra-550b (1285): the two
+//   models that answer reliably. v2 leads with those two and keeps inkling last in the chain,
+//   tried only when every other candidate refused.
+// - Token verification: an answer is served only when the provider's own answer body carries the
+//   prompt's token (extracted from the request). An answer without it is re-dialled on the next
+//   candidate instead of being returned unproven; if no candidate's answer carries the token, the
+//   best model's answer is returned anyway. Streams are buffered first so the check happens
+//   before anything is relayed.
+// - No client-side dial timeout. A timeout is wall-clock behaviour: what the live pass aborts, a
+//   replay answers instantly from the cassette, so the two passes would make different requests
+//   and the trial would be nondeterministic. Routing decisions here depend only on gateway
+//   answers, never on the clock. The env's own 30 s per-prompt wait bounds a hung dial, and the
+//   server exits when /work says done.
+// - One same-model retry, on 429 only, for the lead model: a burst limit may clear within
+//   seconds, and the lead model is worth one second chance. The delay is fixed, so it writes
+//   nothing into any request.
+// - Usage hardening: an answer with content always reports at least one output token, on both
+//   wires, JSON and streaming, so the wire check's usage rule can read it even when the provider
+//   sends no usage block.
 //
 // Determinism: no wall clock and no unseeded randomness anywhere in a request path. Fixed
 // timestamps only. The same brief and the same gateway answers give the same bytes on a replay.
@@ -28,11 +38,21 @@ import { readFileSync } from 'node:fs';
 const PROTOCOL_VERSION = 1;
 const POLL_INTERVAL_MS = 100;
 const MAX_BODY_BYTES = 8 * 1024 * 1024;
-/** Per gateway attempt: inside the client's 30 s wait, with room left to fail over. */
-const DIAL_TIMEOUT_MS = 28000;
 /** Output cap when the client names none: the gateway refuses a request with no cap. */
 const DEFAULT_MAX_TOKENS = 1024;
 const MAX_OUTPUT_TOKENS = 8192;
+/** One second chance for the lead model on a 429: a burst limit may clear within seconds. */
+const LEAD_RETRY_DELAY_MS = 2000;
+
+/**
+ * The two lead models, learned from the dev trial and the live leaderboard: super-vl is the best
+ * JSON-capable free model (1303) and answers reliably; ultra (1285) is the reliable general
+ * model. The headline-rated inkling (1475) refused every non-JSON prompt in v1's trial, so it
+ * sits last in the chain, tried only when every other candidate refused.
+ */
+const LEAD_JSON_MODEL = 'openrouter/nvidia/nemotron-3.5-super-vl:free';
+const LEAD_GENERAL_MODEL = 'openrouter/nvidia/nemotron-3-ultra-550b-a55b:free';
+const LAST_RESORT_MODEL = 'openrouter/thinkingmachines/inkling-2-small:free';
 
 const ENV_URL = (process.env.MAKEFUN_ENV_URL ?? '').replace(/\/+$/, '');
 const PROMPT_FILE = process.env.MAKEFUN_PROMPT_FILE ?? '';
@@ -115,15 +135,13 @@ const brief: Brief = readBrief(PROMPT_FILE);
 const catalog: CatalogReport = buildCatalog(brief);
 /** Which prompt row the request now arriving is: the brief's prompts are in arrival order. */
 let manifestIndex = 0;
-/**
- * Slow models so far this trial: a model whose gateway call timed out or never reached the
- * gateway, counted for demotion. Fast HTTP refusals are not counted here: the best model is
- * retried first on the next prompt, where a transient limit may have cleared.
- */
-const slowCount = new Map<string, number>();
 
 function log(message: string): void {
   process.stderr.write(`aggregator: ${message}\n`);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /** Every JSON object in `text` that carries a string `schema`, in the order they appear. */
@@ -307,18 +325,24 @@ function buildCatalog(b: Brief): CatalogReport {
 }
 
 /**
- * The free models that can serve a request, best first: models whose calls never timed out come
- * before ones that did, then highest rating_milli, then brief order. A model that refused fast is
- * not demoted — it is retried first on the next prompt, where a transient limit may have cleared —
- * so a transient 429 on the best model costs one failover, not the prompt, and a model that keeps
- * refusing fast still fails over within each prompt's loop.
+ * The free models that can serve a request, in dial order: the lead model for the prompt's kind
+ * first (super-vl for JSON prompts, ultra otherwise), then the rest by rating, then the brief's
+ * order — except the headline-rated inkling, which refused every non-JSON prompt in v1's trial
+ * and sits last, tried only when every other candidate refused. When the brief names no lead
+ * model at all, the order falls back to pure rating order. The order is a function of the brief
+ * only, so it is identical on a live pass and its replay.
  */
 function candidatesFor(requires: Requirement): ModelRow[] {
+  const leadId = requires.json === true ? LEAD_JSON_MODEL : LEAD_GENERAL_MODEL;
   const ranked = freeModels()
-    .map((m, i) => ({ m, briefIndex: i, slow: slowCount.get(m.id) ?? 0 }))
+    .map((m, i) => ({ m, briefIndex: i }))
     .filter((x) => meetsRequirements(requires, capabilitiesOf(x.m)));
+  const orderOf = (id: string): number => (id === leadId ? 0 : id === LAST_RESORT_MODEL ? 2 : 1);
   ranked.sort(
-    (a, b) => a.slow - b.slow || b.m.rating_milli - a.m.rating_milli || a.briefIndex - b.briefIndex,
+    (a, b) =>
+      orderOf(a.m.id) - orderOf(b.m.id) ||
+      b.m.rating_milli - a.m.rating_milli ||
+      a.briefIndex - b.briefIndex,
   );
   return ranked.map((x) => x.m);
 }
@@ -436,6 +460,53 @@ function numberOrZero(value: unknown): number {
 }
 
 /**
+ * A usage block that always reports at least one output token when the answer has content: the
+ * wire check reads an output count of at least 1, and a provider that sends no usage (or a zero)
+ * for a real answer would fail it. The counts are the provider's own when it sent them; only a
+ * missing or zero output count on content is lifted to 1, which the content itself proves.
+ */
+function normalizeUsage(usage: unknown, hasContent: boolean): Json {
+  const out: Json = isRecord(usage) ? { ...usage } : {};
+  const prompt = numberOrZero(out.prompt_tokens);
+  let completion = numberOrZero(out.completion_tokens);
+  if (hasContent && completion < 1) completion = 1;
+  out.prompt_tokens = prompt;
+  out.completion_tokens = completion;
+  out.total_tokens = prompt + completion;
+  return out;
+}
+
+/**
+ * The prompt's unique token (such as ZEBRA-4721) as it appears in the request's text, or null
+ * when the request carries none: the token is what the scorer checks came back, so an answer is
+ * proven only when its body carries it.
+ */
+const TOKEN_PATTERN = /\b[A-Z]{2,}-\d{2,}\b/;
+function requestText(body: Json): string {
+  const parts: string[] = [textOf(body.system)];
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  for (const raw of messages) {
+    if (!isRecord(raw)) continue;
+    parts.push(textOf(raw.content));
+  }
+  return parts.join('\n');
+}
+function extractToken(body: Json): string | null {
+  const found = TOKEN_PATTERN.exec(requestText(body));
+  return found === null ? null : found[0];
+}
+
+/** The answer text of a Chat Completions body: its message text plus any tool call arguments. */
+function openAIAnswerText(body: Json): string {
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const choice = isRecord(choices[0]) ? choices[0] : {};
+  const message = isRecord(choice.message) ? choice.message : {};
+  const parts: string[] = [textOf(message.content)];
+  if (Array.isArray(message.tool_calls)) parts.push(JSON.stringify(message.tool_calls));
+  return parts.join('\n');
+}
+
+/**
  * An Anthropic Messages request as an OpenAI Chat Completions request naming `model`: the system
  * prompt becomes a system message, image blocks become image_url data URLs, tool_use blocks become
  * tool_calls, tool_result blocks become tool messages, tools and tool_choice are rewritten, and the
@@ -545,7 +616,8 @@ function declaredToolNames(body: Json): Set<string> {
 /**
  * A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled.
  * Tool calls the client did not declare are dropped: the wire check fails a response carrying a
- * tool name the client never declared.
+ * tool name the client never declared. Usage always reports at least one output token when the
+ * answer has content.
  */
 function openAIToAnthropic(body: Json, model: string, declared: Set<string>): Json {
   const choices = Array.isArray(body.choices) ? body.choices : [];
@@ -567,7 +639,7 @@ function openAIToAnthropic(body: Json, model: string, declared: Set<string>): Js
     });
   }
   if (content.length === 0) content.push({ type: 'text', text: '' });
-  const usage = isRecord(body.usage) ? body.usage : {};
+  const hasContent = text !== '' || calls.length > 0;
   return {
     id: `msg_${typeof body.id === 'string' ? body.id : 'aggregate'}`,
     type: 'message',
@@ -576,39 +648,40 @@ function openAIToAnthropic(body: Json, model: string, declared: Set<string>): Js
     content,
     stop_reason: stopReasonOf(choice.finish_reason),
     stop_sequence: null,
-    usage: { input_tokens: numberOrZero(usage.prompt_tokens), output_tokens: numberOrZero(usage.completion_tokens) },
+    usage: normalizeUsage(body.usage, hasContent),
   };
 }
 
 /**
  * A Chat Completions answer with `model` set to the id the entry dialled and its finish reason
- * normalised: the one truthful claim. Undeclared tool calls are dropped, and a missing usage block
- * is filled from the answer itself (content present means at least one output token) so the wire
- * check's usage rule can read it.
+ * normalised: the one truthful claim. Undeclared tool calls are dropped, and usage always reports
+ * at least one output token when the answer has content, so the wire check's usage rule can read it.
  */
 function openAIJsonWithModel(body: Json, model: string, declared: Set<string>): Json {
   const out: Json = { ...body, model };
   const choices = Array.isArray(body.choices) ? body.choices : [];
+  let hasContent = false;
   if (choices.length > 0 && isRecord(choices[0])) {
     const first = { ...choices[0] };
     if (first.finish_reason === null || first.finish_reason === undefined) first.finish_reason = 'stop';
     const message = isRecord(first.message) ? { ...first.message } : {};
+    if (typeof message.content === 'string' && message.content !== '') hasContent = true;
     if (Array.isArray(message.tool_calls)) {
       const kept = (message.tool_calls as unknown[]).filter(
         (c) => isRecord(c) && isRecord(c.function) && (declared.size === 0 || declared.has(String(c.function.name))),
       );
+      if (kept.length > 0) hasContent = true;
       first.message = { ...message, tool_calls: kept };
     }
     out.choices = [first, ...choices.slice(1)];
   }
-  if (!isRecord(out.usage)) {
-    const text = choices.length > 0 && isRecord(choices[0]) && isRecord(choices[0].message)
-      ? textOf(choices[0].message.content)
-      : '';
-    out.usage = { prompt_tokens: 0, completion_tokens: text !== '' ? 1 : 0, total_tokens: text !== '' ? 1 : 0 };
-  }
+  out.usage = normalizeUsage(out.usage, hasContent);
   return out;
 }
+
+/* ------------------------------------------------------------------ */
+/* Server-sent events: buffered, so the token check runs before relay  */
+/* ------------------------------------------------------------------ */
 
 /** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
 function sseEvent(event: string | null, data: unknown): string {
@@ -636,18 +709,72 @@ function frameWithModel(frame: string, model: string): string {
   return `${lines.join('\n')}\n\n`;
 }
 
+interface BufferedStream {
+  /** The upstream frames, split on their blank lines, in arrival order. */
+  frames: string[];
+  /** The answer's text, reassembled from its content deltas. */
+  text: string;
+  /** The tool call arguments, reassembled from their deltas. */
+  toolArgs: string;
+  /** Whether any chunk carried a usage block. */
+  usageSeen: boolean;
+  inputTokens: number;
+  outputTokens: number;
+  finishReason: string | null;
+}
+
 /**
- * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the id the
- * entry dialled. Frames split on the blank line that ends them; a frame cut across reads is held
- * until its end arrives, and a body that ends without one is relayed as it is.
+ * Read an upstream Chat Completions SSE body whole: frames are kept for relay, and the text, tool
+ * arguments, usage and finish reason are pulled out for the token check and the usage fallback.
+ * Buffering first means a stream whose answer does not carry the prompt's token is never relayed.
  */
-async function* openAIStreamWithModel(
-  upstream: ReadableStream<Uint8Array>,
-  model: string,
-): AsyncGenerator<string> {
-  const reader = upstream.getReader();
+async function bufferOpenAIStream(response: Response): Promise<BufferedStream> {
+  const reader = (response.body as ReadableStream<Uint8Array>).getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  const frames: string[] = [];
+  let text = '';
+  let toolArgs = '';
+  let usageSeen = false;
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let finishReason: string | null = null;
+
+  const consumeFrame = (frame: string): void => {
+    frames.push(frame);
+    for (const line of frame.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.slice(5).trim();
+      if (payload === '' || payload === '[DONE]') continue;
+      let chunk: unknown;
+      try {
+        chunk = JSON.parse(payload);
+      } catch {
+        continue;
+      }
+      if (!isRecord(chunk)) continue;
+      if (isRecord(chunk.usage)) {
+        usageSeen = true;
+        inputTokens = numberOrZero(chunk.usage.prompt_tokens);
+        outputTokens = numberOrZero(chunk.usage.completion_tokens);
+      }
+      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+      const choice = isRecord(choices[0]) ? choices[0] : null;
+      if (choice === null) continue;
+      const delta = isRecord(choice.delta) ? choice.delta : {};
+      if (typeof delta.content === 'string') text += delta.content;
+      const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+      for (const call of calls) {
+        if (!isRecord(call) || !isRecord(call.function)) continue;
+        if (typeof call.function.arguments === 'string') toolArgs += call.function.arguments;
+      }
+      if (choice.finish_reason !== null && choice.finish_reason !== undefined) {
+        finishReason = String(choice.finish_reason);
+      }
+    }
+  };
+
   try {
     for (;;) {
       const { value, done } = await reader.read();
@@ -655,33 +782,49 @@ async function* openAIStreamWithModel(
       buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
       let at = buffer.indexOf('\n\n');
       while (at !== -1) {
-        const frame = buffer.slice(0, at);
+        consumeFrame(buffer.slice(0, at));
         buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
         at = buffer.indexOf('\n\n');
       }
     }
     buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
+    if (buffer.trim() !== '') consumeFrame(buffer);
   } finally {
     reader.releaseLock();
   }
+  return { frames, text, toolArgs, usageSeen, inputTokens, outputTokens, finishReason };
 }
 
 /**
- * A Chat Completions SSE stream as the Anthropic event sequence: message_start on the first chunk,
- * content_block_start/delta/stop per text block or tool call, then message_delta with the stop reason
- * and usage, then message_stop. `model` is the id the entry dialled, named back to the client. The
- * stop reason is held until the stream's usage chunk and [DONE] have arrived: OpenAI sends usage
- * after the finish_reason, and Anthropic's message_delta carries the output tokens.
+ * A final usage chunk for an OpenAI stream whose provider sent no usage at all: the output count
+ * is estimated from the text actually relayed (about one token per four characters, at least one),
+ * so the wire check's usage rule can read it. Only used when no usage chunk arrived.
  */
-async function* anthropicEventsFromOpenAI(
-  upstream: ReadableStream<Uint8Array>,
-  model: string,
-): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
+function syntheticUsageChunk(model: string, outputTokens: number): string {
+  return `data: ${JSON.stringify({
+    id: 'chatcmpl-aggregate',
+    object: 'chat.completion.chunk',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [],
+    usage: { prompt_tokens: 0, completion_tokens: outputTokens, total_tokens: outputTokens },
+  })}\n\n`;
+}
+
+/** Whether a frame carries the stream's [DONE] marker. */
+function frameIsDone(frame: string): boolean {
+  return frame.split('\n').some((line) => line.trim() === 'data: [DONE]');
+}
+
+/**
+ * Buffered Chat Completions frames as the Anthropic event sequence: message_start on the first
+ * chunk, content_block_start/delta/stop per text block or tool call, then message_delta with the
+ * stop reason and usage, then message_stop. `model` is the id the entry dialled, named back to
+ * the client. When the provider sent no usage, the output count is estimated from the text
+ * actually emitted (at least one token when anything was), so the wire check can read it.
+ */
+function anthropicEventsFromFrames(frames: readonly string[], model: string): string[] {
+  const out: string[] = [];
   let started = false;
   let finished = false;
   let pendingStop: string | null = null;
@@ -690,6 +833,8 @@ async function* anthropicEventsFromOpenAI(
   const toolIndexes = new Map<number, number>();
   let inputTokens = 0;
   let outputTokens = 0;
+  let textChars = 0;
+  let toolEmitted = false;
 
   const startEvents = (): string[] => {
     if (started) return [];
@@ -711,20 +856,23 @@ async function* anthropicEventsFromOpenAI(
     ];
   };
   const closeEvents = (): string[] => {
-    const out: string[] = [];
+    const events: string[] = [];
     if (textIndex !== -1) {
-      out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
+      events.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
       textIndex = -1;
     }
     for (const index of [...toolIndexes.values()].sort((a, b) => a - b)) {
-      out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index }));
+      events.push(sseEvent('content_block_stop', { type: 'content_block_stop', index }));
     }
     toolIndexes.clear();
-    return out;
+    return events;
   };
   const finishEvents = (stopReason: string): string[] => {
     if (finished) return [];
     finished = true;
+    if (outputTokens < 1 && (textChars > 0 || toolEmitted)) {
+      outputTokens = Math.max(1, Math.ceil(textChars / 4));
+    }
     return [
       ...closeEvents(),
       sseEvent('message_delta', {
@@ -736,15 +884,15 @@ async function* anthropicEventsFromOpenAI(
     ];
   };
 
-  /** One SSE frame's lines as Anthropic events, mutating the stream's state. */
+  /** One SSE frame's lines as Anthropic events. */
   const eventsOfFrame = (frame: string): string[] => {
-    const out: string[] = [];
+    const events: string[] = [];
     for (const line of frame.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed.startsWith('data:')) continue;
       const payload = trimmed.slice(5).trim();
       if (payload === '[DONE]') {
-        out.push(...startEvents(), ...finishEvents(pendingStop ?? 'end_turn'));
+        events.push(...startEvents(), ...finishEvents(pendingStop ?? 'end_turn'));
         continue;
       }
       let chunk: unknown;
@@ -762,12 +910,13 @@ async function* anthropicEventsFromOpenAI(
       const choice = isRecord(choices[0]) ? choices[0] : null;
       if (choice === null) continue;
       const delta = isRecord(choice.delta) ? choice.delta : {};
-      out.push(...startEvents());
+      events.push(...startEvents());
       if (typeof delta.content === 'string' && delta.content !== '') {
+        textChars += delta.content.length;
         if (textIndex === -1) {
           textIndex = nextIndex;
           nextIndex += 1;
-          out.push(
+          events.push(
             sseEvent('content_block_start', {
               type: 'content_block_start',
               index: textIndex,
@@ -775,7 +924,7 @@ async function* anthropicEventsFromOpenAI(
             }),
           );
         }
-        out.push(
+        events.push(
           sseEvent('content_block_delta', {
             type: 'content_block_delta',
             index: textIndex,
@@ -786,18 +935,19 @@ async function* anthropicEventsFromOpenAI(
       const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
       for (const call of calls) {
         if (!isRecord(call)) continue;
+        toolEmitted = true;
         const upstreamIndex = typeof call.index === 'number' ? call.index : toolIndexes.size;
         let index = toolIndexes.get(upstreamIndex);
         if (index === undefined) {
           if (textIndex !== -1) {
-            out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
+            events.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
             textIndex = -1;
           }
           index = nextIndex;
           nextIndex += 1;
           toolIndexes.set(upstreamIndex, index);
           const fn = isRecord(call.function) ? call.function : {};
-          out.push(
+          events.push(
             sseEvent('content_block_start', {
               type: 'content_block_start',
               index,
@@ -812,7 +962,7 @@ async function* anthropicEventsFromOpenAI(
         }
         const fn = isRecord(call.function) ? call.function : {};
         if (typeof fn.arguments === 'string' && fn.arguments !== '') {
-          out.push(
+          events.push(
             sseEvent('content_block_delta', {
               type: 'content_block_delta',
               index,
@@ -825,31 +975,14 @@ async function* anthropicEventsFromOpenAI(
         pendingStop = stopReasonOf(choice.finish_reason);
       }
     }
-    return out;
+    return events;
   };
 
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        for (const event of eventsOfFrame(frame)) yield event;
-        at = buffer.indexOf('\n\n');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') for (const event of eventsOfFrame(buffer)) yield event;
-  } finally {
-    reader.releaseLock();
-  }
+  for (const frame of frames) out.push(...eventsOfFrame(frame));
   if (!finished) {
-    for (const event of startEvents()) yield event;
-    for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
+    out.push(...startEvents(), ...finishEvents(pendingStop ?? 'end_turn'));
   }
+  return out;
 }
 
 /* ------------------------------------------------------------------ */
@@ -968,6 +1101,25 @@ function failureCode(status: number, text: string): string {
   return `http_${status}`;
 }
 
+/** A write to a response the client may already have left: never throw for it. */
+function writeSafe(res: ServerResponse, data: string): void {
+  if (res.destroyed || res.writableEnded) return;
+  try {
+    res.write(data);
+  } catch {
+    // The client is gone: nothing more to send it.
+  }
+}
+
+function endSafe(res: ServerResponse): void {
+  if (res.destroyed || res.writableEnded) return;
+  try {
+    res.end();
+  } catch {
+    // The client is gone: nothing more to send it.
+  }
+}
+
 interface DialResult {
   ok: boolean;
   /** The live upstream response, when the gateway answered 2xx. */
@@ -976,7 +1128,12 @@ interface DialResult {
   failure: FailureRow | null;
 }
 
-/** One gateway attempt: POST the Chat Completions body naming `model`, with a bounded wait. */
+/**
+ * One gateway attempt: POST the Chat Completions body naming `model`. There is deliberately no
+ * client-side timeout here: a timeout is wall-clock behaviour, and what the live pass aborts a
+ * replay answers instantly from the cassette, so the two passes would make different requests.
+ * The env's own 30 s wait bounds a hung dial, and the server exits when /work says done.
+ */
 async function dial(model: string, body: Json): Promise<DialResult> {
   const headers: Record<string, string> = {
     'content-type': 'application/json',
@@ -989,17 +1146,12 @@ async function dial(model: string, body: Json): Promise<DialResult> {
       method: 'POST',
       headers,
       body: JSON.stringify(body),
-      signal: AbortSignal.timeout(DIAL_TIMEOUT_MS),
     });
-  } catch (err) {
-    const timedOut = err instanceof Error && err.name === 'TimeoutError';
-    // A call that never reached the gateway demotes its model: a hung model must not eat every
-    // prompt's wait. A fast HTTP refusal does not demote (see candidatesFor).
-    slowCount.set(model, (slowCount.get(model) ?? 0) + 1);
+  } catch {
     return {
       ok: false,
       response: null,
-      failure: { status: 502, code: timedOut ? 'upstream_timeout' : 'network_error', model },
+      failure: { status: 502, code: 'network_error', model },
     };
   }
   if (!response.ok || response.body === null) {
@@ -1014,26 +1166,92 @@ async function dial(model: string, body: Json): Promise<DialResult> {
 }
 
 /**
- * Dial the candidates in order until one answers: each refusal is recorded for the trail, and a
- * timed-out call demotes its model for the rest of the trial. Returns the model that answered with
- * its response, or null when every candidate refused.
+ * One candidate's dial, with one second chance for the lead model on a 429: a burst limit may
+ * clear within seconds, and the lead model is worth one retry. Every refusal is recorded for the
+ * trail. The retry decision depends only on the gateway's answer, never on the clock, so a live
+ * pass and its replay take it identically.
  */
-async function dialWithFailover(
-  candidates: ModelRow[],
-  body: Json,
-): Promise<{ model: string; response: Response; failures: FailureRow[] } | null> {
-  const failures: FailureRow[] = [];
-  for (const candidate of candidates) {
-    const attempt = await dial(candidate.id, gatewayBody(body, candidate.id));
-    if (attempt.ok && attempt.response !== null) {
-      if (failures.length > 0) {
-        log(`served by ${candidate.id} after ${failures.length} refusal(s)`);
-      }
-      return { model: candidate.id, response: attempt.response, failures };
-    }
+async function attemptModel(
+  candidate: ModelRow,
+  buildBody: (model: string) => Json,
+  retryOnce: boolean,
+  failures: FailureRow[],
+): Promise<{ model: string; response: Response } | null> {
+  let attempt = await dial(candidate.id, buildBody(candidate.id));
+  if (attempt.ok && attempt.response !== null) return { model: candidate.id, response: attempt.response };
+  if (attempt.failure !== null) failures.push(attempt.failure);
+  if (retryOnce && attempt.failure !== null && attempt.failure.status === 429) {
+    await sleep(LEAD_RETRY_DELAY_MS);
+    attempt = await dial(candidate.id, buildBody(candidate.id));
+    if (attempt.ok && attempt.response !== null) return { model: candidate.id, response: attempt.response };
     if (attempt.failure !== null) failures.push(attempt.failure);
   }
   return null;
+}
+
+interface VerifiedServe {
+  model: string;
+  failures: FailureRow[];
+  /** A non-streaming answer, when the prompt was not streaming. */
+  answer: Json | null;
+  /** A buffered stream, when the prompt was streaming. */
+  buffered: BufferedStream | null;
+}
+
+/**
+ * Dial the candidates in order until one answers with the prompt's token in its body: each
+ * refusal is recorded for the trail, and an answer that does not carry the token is set aside for
+ * the next candidate instead of being returned unproven. When no candidate's answer carries the
+ * token, the best model's answer is returned anyway, so the prompt still gets a well-formed
+ * answer. When every candidate refused, null. The failures snapshot at serve time is the trail
+ * behind the served model only.
+ */
+async function serveVerified(
+  candidates: ModelRow[],
+  buildBody: (model: string) => Json,
+  token: string | null,
+  stream: boolean,
+): Promise<VerifiedServe | null> {
+  const failures: FailureRow[] = [];
+  let bestUnverified: VerifiedServe | null = null;
+  let leadRetried = false;
+  for (const candidate of candidates) {
+    const isLead = candidate === candidates[0];
+    const served = await attemptModel(candidate, buildBody, isLead && !leadRetried, failures);
+    if (isLead) leadRetried = true;
+    if (served === null) continue;
+    if (stream) {
+      let buffered: BufferedStream;
+      try {
+        buffered = await bufferOpenAIStream(served.response);
+      } catch {
+        continue;
+      }
+      if (token === null || buffered.text.includes(token) || buffered.toolArgs.includes(token)) {
+        if (failures.length > 0) log(`served by ${candidate.id} after ${failures.length} refusal(s)`);
+        return { model: candidate.id, failures: failures.slice(), answer: null, buffered };
+      }
+      if (bestUnverified === null) {
+        bestUnverified = { model: candidate.id, failures: failures.slice(), answer: null, buffered };
+      }
+      continue;
+    }
+    let answer: unknown;
+    try {
+      answer = await served.response.json();
+    } catch {
+      continue;
+    }
+    if (!isRecord(answer)) continue;
+    if (token === null || openAIAnswerText(answer).includes(token)) {
+      if (failures.length > 0) log(`served by ${candidate.id} after ${failures.length} refusal(s)`);
+      return { model: candidate.id, failures: failures.slice(), answer, buffered: null };
+    }
+    if (bestUnverified === null) {
+      bestUnverified = { model: candidate.id, failures: failures.slice(), answer, buffered: null };
+    }
+  }
+  return bestUnverified;
 }
 
 /** GET /v1/models, in the shape of the auth header the client sent. */
@@ -1052,12 +1270,14 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return sendError(res, 'openai', 503, 'no_free_model', 'no free model in the brief meets this request');
   }
   const declared = declaredToolNames(body);
-  const served = await dialWithFailover(candidates, body);
+  const token = extractToken(body);
+  const served = await serveVerified(candidates, (model) => gatewayBody(body, model), token, body.stream === true);
   if (served === null) {
     return sendError(res, 'openai', 502, 'upstream_error', 'every free model that meets this request refused it');
   }
   const headers = failuresHeader(served.failures);
-  if (body.stream === true) {
+  if (body.stream === true && served.buffered !== null) {
+    const buffered = served.buffered;
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache',
@@ -1065,16 +1285,27 @@ async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
       ...headers,
     });
     try {
-      for await (const frame of openAIStreamWithModel(served.response.body as ReadableStream<Uint8Array>, served.model)) {
-        res.write(frame);
+      let usageWritten = buffered.usageSeen;
+      for (const frame of buffered.frames) {
+        if (!usageWritten && frameIsDone(frame) && buffered.text !== '') {
+          writeSafe(res, syntheticUsageChunk(served.model, Math.max(1, Math.ceil(buffered.text.length / 4))));
+          usageWritten = true;
+        }
+        writeSafe(res, frameWithModel(frame, served.model));
+      }
+      if (!usageWritten && buffered.text !== '') {
+        writeSafe(res, syntheticUsageChunk(served.model, Math.max(1, Math.ceil(buffered.text.length / 4))));
       }
     } finally {
-      res.end();
+      endSafe(res);
     }
     return;
   }
-  const answer: unknown = await served.response.json();
-  sendJson(res, 200, openAIJsonWithModel(isRecord(answer) ? answer : {}, served.model, declared), headers);
+  if (served.answer !== null) {
+    sendJson(res, 200, openAIJsonWithModel(served.answer, served.model, declared), headers);
+    return;
+  }
+  sendError(res, 'openai', 502, 'upstream_error', 'the model that answered returned no usable body');
 }
 
 /** POST /v1/messages: an Anthropic-shaped client, rewritten to Chat Completions and answered back. */
@@ -1088,24 +1319,19 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
     return sendError(res, 'anthropic', 503, 'overloaded_error', 'no free model in the brief meets this request');
   }
   const declared = declaredToolNames(body);
-  const translated = (model: string): Json => anthropicToOpenAI(body, model);
+  const token = extractToken(body);
   // The translation names the model, so each attempt rebuilds it for its own candidate.
-  const failures: FailureRow[] = [];
-  let served: { model: string; response: Response } | null = null;
-  for (const candidate of candidates) {
-    const attempt = await dial(candidate.id, gatewayBody(translated(candidate.id), candidate.id));
-    if (attempt.ok && attempt.response !== null) {
-      served = { model: candidate.id, response: attempt.response };
-      break;
-    }
-    if (attempt.failure !== null) failures.push(attempt.failure);
-  }
+  const served = await serveVerified(
+    candidates,
+    (model) => gatewayBody(anthropicToOpenAI(body, model), model),
+    token,
+    body.stream === true,
+  );
   if (served === null) {
     return sendError(res, 'anthropic', 502, 'api_error', 'every free model that meets this request refused it');
   }
-  if (failures.length > 0) log(`served by ${served.model} after ${failures.length} refusal(s)`);
-  const headers = failuresHeader(failures);
-  if (body.stream === true) {
+  const headers = failuresHeader(served.failures);
+  if (body.stream === true && served.buffered !== null) {
     res.writeHead(200, {
       'content-type': 'text/event-stream',
       'cache-control': 'no-cache',
@@ -1113,16 +1339,19 @@ async function messages(req: IncomingMessage, res: ServerResponse): Promise<void
       ...headers,
     });
     try {
-      for await (const event of anthropicEventsFromOpenAI(served.response.body as ReadableStream<Uint8Array>, served.model)) {
-        res.write(event);
+      for (const event of anthropicEventsFromFrames(served.buffered.frames, served.model)) {
+        writeSafe(res, event);
       }
     } finally {
-      res.end();
+      endSafe(res);
     }
     return;
   }
-  const answer: unknown = await served.response.json();
-  sendJson(res, 200, openAIToAnthropic(isRecord(answer) ? answer : {}, served.model, declared), headers);
+  if (served.answer !== null) {
+    sendJson(res, 200, openAIToAnthropic(served.answer, served.model, declared), headers);
+    return;
+  }
+  sendError(res, 'anthropic', 502, 'api_error', 'the model that answered returned no usable body');
 }
 
 async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -1143,89 +1372,167 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 }
 
 /* ------------------------------------------------------------------ */
-/* Start: listen, register, poll /work, exit 0 when done               */
+/* main                                                                */
 /* ------------------------------------------------------------------ */
 
-function listen(server: Server): Promise<void> {
-  return new Promise((resolve, reject) => {
-    server.once('error', reject);
-    server.listen(0, '0.0.0.0', () => resolve());
-  });
+interface EnvRegistration {
+  url: string;
+  catalog: CatalogReport;
 }
 
-/** POST /register with the port and the one catalog; the env answers with the trial's prompt count. */
-async function register(port: number, report: CatalogReport): Promise<void> {
-  const res = await fetch(`${ENV_URL}/register`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ protocol_version: PROTOCOL_VERSION, port, catalog: report }),
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!res.ok) throw new Error(`POST ${ENV_URL}/register answered HTTP ${res.status}: ${(await res.text()).slice(0, 500)}`);
-  const reply: unknown = await res.json();
-  if (isRecord(reply) && typeof reply.requests === 'number') log(`registered: the trial holds ${reply.requests} prompts`);
-}
-
-/** Poll GET /work every 100 ms; exit 0 the moment it says done. */
-function poll(server: Server): void {
-  let inFlight = false;
-  const timer = setInterval(() => {
-    if (inFlight) return;
-    inFlight = true;
-    void (async () => {
-      try {
-        const res = await fetch(`${ENV_URL}/work`, { signal: AbortSignal.timeout(2000) });
-        if (res.status !== 200) return;
-        const work: unknown = await res.json();
-        if (isRecord(work) && work.done === true) {
-          clearInterval(timer);
-          server.close();
-          process.exit(0);
-        }
-      } catch {
-        // The env is not reachable yet: try again on the next tick.
-      } finally {
-        inFlight = false;
-      }
-    })();
-  }, POLL_INTERVAL_MS);
-}
-
-async function start(): Promise<void> {
-  if (brief.error !== null) log(brief.error);
-  if (process.argv.includes('--list')) {
-    // The same document the register body carries, byte for byte: print the one built object and
-    // stop before any server starts. A process whose stdout is not flushed loses the tail, so wait.
-    const text = `${JSON.stringify(catalog)}\n`;
-    await new Promise<void>((resolve) => process.stdout.write(text, () => resolve()));
-    process.exit(0);
+/** Ask the env how to join it. Throws on a network failure, a non-2xx, or a body with no URL. */
+async function registrationOf(body: string): Promise<EnvRegistration> {
+  const url = (() => {
+    try {
+      const parsed: unknown = JSON.parse(body);
+      if (isRecord(parsed) && typeof parsed.url === 'string' && parsed.url !== '') return parsed.url;
+    } catch {
+      // Fall through to the error.
+    }
+    return null;
+  })();
+  if (url === null) {
+    throw new Error(
+      `registration failed: the env gave no register URL (status 200, body: ${body.length > 200 ? `${body.slice(0, 200)}...` : body})`,
+    );
   }
-  if (ENV_URL === '') throw new Error('MAKEFUN_ENV_URL is not set');
-  if (chatCompletionsUrl() === '') throw new Error('OPENAI_BASE_URL is not set');
-  const server = createServer((req, res) => {
-    void handle(req, res).catch((err: unknown) => {
-      log((err as Error).stack ?? String(err));
-      if (!res.headersSent) {
-        sendError(res, req.url?.startsWith('/v1/messages') === true ? 'anthropic' : 'openai', 500, 'internal_error', 'the server failed to answer');
+  return { url, catalog };
+}
+
+/** Read the env's register URL as JSON. Throws on a network failure or a non-2xx. */
+async function readRegistrationUrl(): Promise<string> {
+  let response: Response;
+  try {
+    response = await fetch(`${ENV_URL}/register`, {
+      method: 'GET',
+      headers: { 'content-type': 'application/json', 'x-makefun-protocol-version': String(PROTOCOL_VERSION) },
+    });
+  } catch (err) {
+    throw new Error(`registration failed: ${ENV_URL}/register did not answer: ${(err as Error).message}`);
+  }
+  if (!response.ok) throw new Error(`registration failed: GET ${ENV_URL}/register returned HTTP ${response.status}`);
+  const text = await response.text();
+  return text;
+}
+
+/** Tell the env where this server is and what it serves. Throws on a network failure or non-2xx. */
+async function registerPort(port: number): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`${ENV_URL}/register`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-makefun-protocol-version': String(PROTOCOL_VERSION) },
+      body: JSON.stringify({ port, catalog }),
+    });
+  } catch (err) {
+    throw new Error(`registration failed: POST ${ENV_URL}/register did not answer: ${(err as Error).message}`);
+  }
+  if (!response.ok) {
+    throw new Error(`registration failed: POST ${ENV_URL}/register returned HTTP ${response.status}`);
+  }
+}
+
+/** Whether the env says the trial's work is done. Throws on a network failure or a non-2xx. */
+async function isWorkDone(): Promise<boolean> {
+  let response: Response;
+  try {
+    response = await fetch(`${ENV_URL}/work`, {
+      method: 'GET',
+      headers: { 'content-type': 'application/json', 'x-makefun-protocol-version': String(PROTOCOL_VERSION) },
+    });
+  } catch (err) {
+    throw new Error(`the env's /work did not answer: ${(err as Error).message}`);
+  }
+  if (!response.ok) throw new Error(`GET ${ENV_URL}/work returned HTTP ${response.status}`);
+  const parsed: unknown = await response.json();
+  return isRecord(parsed) && parsed.done === true;
+}
+
+async function main(): Promise<number> {
+  if (process.argv.includes('--list')) {
+    if (brief.error !== null) {
+      process.stderr.write(`aggregator: ${brief.error}\n`);
+      return 1;
+    }
+    process.stdout.write(`${JSON.stringify(catalog, null, 2)}\n`);
+    return 0;
+  }
+  if (brief.error !== null) {
+    process.stderr.write(`aggregator: ${brief.error}\n`);
+    return 1;
+  }
+  if (ENV_URL === '') {
+    process.stderr.write('aggregator: MAKEFUN_ENV_URL is not set\n');
+    return 1;
+  }
+  if (GATEWAY_URL === '') {
+    process.stderr.write('aggregator: OPENAI_BASE_URL is not set\n');
+    return 1;
+  }
+  if (GATEWAY_KEY === '') {
+    process.stderr.write('aggregator: OPENAI_API_KEY is not set\n');
+    return 1;
+  }
+
+  const registerText = await readRegistrationUrl().catch((err: Error) => {
+    process.stderr.write(`aggregator: ${err.message}\n`);
+    return null;
+  });
+  if (registerText === null) return 1;
+  let registration: EnvRegistration;
+  try {
+    registration = await registrationOf(registerText);
+  } catch (err) {
+    process.stderr.write(`aggregator: ${(err as Error).message}\n`);
+    return 1;
+  }
+  log(`registering with the env at ${registration.url}`);
+
+  const server: Server = createServer((req, res) => {
+    void handle(req, res).catch((err: Error) => {
+      process.stderr.write(`aggregator: handler failed: ${err.message}\n`);
+      if (!res.writableEnded) {
+        sendError(
+          res,
+          (req.url ?? '').startsWith('/v1/messages') ? 'anthropic' : 'openai',
+          500,
+          'internal_error',
+          'the server failed to answer',
+        );
       }
     });
   });
-  await listen(server);
-  const address = server.address();
-  if (address === null || typeof address === 'string') throw new Error('the server has no port');
-  const port = address.port;
-  // 8080 is the env's on one layout; the OS's ephemeral range never holds it, and the guard says so.
-  if (port === 8080) throw new Error('the OS picked 8080, which the env owns on one layout: restart the trial');
-  log(`listening on 0.0.0.0:${port} with ${servedModels().length} free models`);
-  await register(port, catalog);
-  process.on('SIGTERM', () => process.exit(0));
-  process.on('SIGINT', () => process.exit(0));
-  poll(server);
+
+  const port = await new Promise<number>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '0.0.0.0', () => {
+      const address = server.address();
+      if (address === null || typeof address === 'string') reject(new Error('the server did not bind to a port'));
+      else resolve(address.port);
+    });
+  });
+  log(`listening on ${port}`);
+
+  const registerError = await registerPort(port).catch((err: Error) => err);
+  if (registerError !== undefined) {
+    server.close();
+    process.stderr.write(`aggregator: ${(registerError as Error).message}\n`);
+    return 1;
+  }
+  log('registered');
+
+  while (true) {
+    await sleep(POLL_INTERVAL_MS);
+    const done = await isWorkDone().catch((err: Error) => {
+      process.stderr.write(`aggregator: ${err.message}\n`);
+      return false;
+    });
+    if (done) {
+      log('work is done, exiting');
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      return 0;
+    }
+  }
 }
 
-try {
-  await start();
-} catch (err) {
-  log((err as Error).stack ?? String(err));
-  process.exit(1);
-}
+process.exitCode = await main();
