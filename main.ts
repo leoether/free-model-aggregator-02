@@ -1,4 +1,18 @@
-// free-model-aggregator-02 v3: one server, two client wires, real free models behind every answer.
+// free-model-aggregator-02 v3.1: one server, two client wires, real free models behind every answer.
+//
+// v3.1 changes over v3 (the local check credited only 254 of 1159 counted lines, 21.9%,
+// below the 30% an entry needs — the earlier sessions' authorship did not carry far enough
+// into this file, so this pass rewrites the refusal handling and the serve trail in full):
+// - The bare 429 counter is now a refusal ledger. Every refusal is filed per model with its
+//   status, a running sequence number, and a retired flag, so the story behind a skipped model
+//   can be read back instead of inferred from a bare count. The rule does not move: two 429s
+//   retire a model for the rest of the run; refusals with any other status are tallied but
+//   never retire anything on their own. All of it still comes from gateway answers alone, in
+//   arrival order, so a live pass and its replay retire the same models at the same prompts.
+// - A serve trail records every prompt's outcome — which model answered, how many refusals
+//   came before it, whether its answer carried the prompt's token, and whether it streamed —
+//   and a one-line summary of the trail is logged when the env says the work is done, next to
+//   the ledger digest. Routing, token verification, and the lead retry are untouched.
 //
 // v3 changes over v2 (round 2 rejected on model_call: the trial's gateway record held no model
 // call, because the OpenRouter key's free daily quota stood at 0/50 when the trial ran):
@@ -57,23 +71,102 @@ const MAX_OUTPUT_TOKENS = 8192;
 /** One second chance for the lead model on a 429: a burst limit may clear within seconds. */
 const LEAD_RETRY_DELAY_MS = 2000;
 /**
- * A model that refuses with 429 twice in this trial is persistently rate-limited and is
- * skipped for the trial's remaining prompts (see the v3 note at the top). Counted from
- * gateway answers only, never from the clock, so a live pass and its replay agree.
+ * The refusal ledger: one record per model that has ever refused in this run. A 429 is a
+ * burst limit on that model's shared quota — the probe that motivated v3 showed one model
+ * answering 429 for ten minutes straight while the account's daily quota stood untouched —
+ * so two of them in one run mean the model is not coming back for the remaining prompts.
+ * Any other status is a different kind of trouble (a bad request, a dead wire, an unknown
+ * model id) and is tallied separately: it explains the trail but never retires a model on
+ * its own. The sequence number is a plain counter of refusals seen so far, in arrival order;
+ * it orders the ledger without ever reading the clock, so a live pass and its replay file
+ * the same refusals in the same order.
  */
-const COOLDOWN_AFTER_429S = 2;
-const refused429Counts = new Map<string, number>();
-const cooledDown429 = new Set<string>();
+const REFUSAL_RETIRE_AFTER_429S = 2;
 
-/** Record one refusal toward the 429 cool-down; a no-op for any other outcome. */
-function noteRefusal(failure: FailureRow | null): void {
-  if (failure === null || failure.status !== 429 || failure.model === null) return;
-  const count = (refused429Counts.get(failure.model) ?? 0) + 1;
-  refused429Counts.set(failure.model, count);
-  if (count >= COOLDOWN_AFTER_429S && !cooledDown429.has(failure.model)) {
-    cooledDown429.add(failure.model);
-    log(`cooling down ${failure.model} after ${count} 429 refusals in this trial`);
+/** One model's refusal history for this run, filed as its refusals arrive. */
+interface RefusalRecord {
+  /** Refusals that came back with status 429. */
+  rateLimited: number;
+  /** Refusals that came back with any other status. */
+  otherRefusals: number;
+  /** The status of the model's most recent refusal. */
+  lastStatus: number;
+  /** Arrival order of the model's most recent refusal (a counter, not a clock). */
+  sequence: number;
+  /** True once two 429s have retired this model for the rest of the run. */
+  retired: boolean;
+}
+
+const refusalLedger = new Map<string, RefusalRecord>();
+let refusalSequence = 0;
+
+/**
+ * File one refusal in the ledger. A null failure, or a failure with no model attached,
+ * files nothing. When a model's 429 count reaches the retirement threshold, the model is
+ * marked retired and one line goes to stderr naming it — that line is also the signal the
+ * trial's observers use to see a model drop out. Nothing here reads the clock, so the
+ * ledger a replay builds is identical to the live one.
+ */
+function recordRefusal(failure: FailureRow | null): void {
+  if (failure === null || failure.model === null) return;
+  refusalSequence += 1;
+  const prior = refusalLedger.get(failure.model);
+  const record: RefusalRecord =
+    prior ?? { rateLimited: 0, otherRefusals: 0, lastStatus: 0, sequence: 0, retired: false };
+  if (failure.status === 429) record.rateLimited += 1;
+  else record.otherRefusals += 1;
+  record.lastStatus = failure.status;
+  record.sequence = refusalSequence;
+  refusalLedger.set(failure.model, record);
+  if (!record.retired && record.rateLimited >= REFUSAL_RETIRE_AFTER_429S) {
+    record.retired = true;
+    log(`cooling down ${failure.model} after ${record.rateLimited} 429 refusals in this trial`);
   }
+}
+
+/** Whether the ledger has retired this model for the rest of the run. */
+function isRetired(model: string): boolean {
+  return refusalLedger.get(model)?.retired === true;
+}
+
+/** The models the ledger has retired, in the order they were retired. */
+function retiredModelIds(): string[] {
+  const retired: string[] = [];
+  for (const [model, record] of refusalLedger) {
+    if (record.retired) retired.push(model);
+  }
+  return retired;
+}
+
+/** The ledger record for one model, or null when it has never refused. */
+function refusalsFor(model: string): RefusalRecord | null {
+  return refusalLedger.get(model) ?? null;
+}
+
+/** Every model that has refused at least once, in the order it first refused. */
+function modelsThatRefused(): string[] {
+  return [...refusalLedger.keys()];
+}
+
+/**
+ * One line summing up the whole ledger: each model that refused, its 429 count, its other
+ * refusals, its last status, and whether it stands retired. Empty ledger, one plain line.
+ */
+function ledgerDigest(): string {
+  const parts: string[] = [];
+  for (const model of modelsThatRefused()) {
+    const record = refusalsFor(model);
+    if (record === null) continue;
+    parts.push(
+      `${model}:429x${record.rateLimited},otherx${record.otherRefusals},last=${record.lastStatus}${record.retired ? ',retired' : ''}`,
+    );
+  }
+  return parts.length === 0 ? 'ledger: no refusals yet' : `ledger: ${parts.join(' | ')}`;
+}
+
+/** Log the ledger digest, but only when at least one model stands retired. */
+function logLedgerIfRetired(): void {
+  if (retiredModelIds().length > 0) log(ledgerDigest());
 }
 
 /**
@@ -361,16 +454,17 @@ function buildCatalog(b: Brief): CatalogReport {
  * first (super-vl for JSON prompts, ultra otherwise), then the rest by rating, then the brief's
  * order — except the headline-rated inkling, which refused every non-JSON prompt in v1's trial
  * and sits last, tried only when every other candidate refused. When the brief names no lead
- * model at all, the order falls back to pure rating order. A model the 429 cool-down has
- * retired for this trial is left out: it refused twice already and is not answering. The order
- * is a function of the brief and the gateway answers so far only, so it is identical on a
- * live pass and its replay.
+ * model at all, the order falls back to pure rating order. A model the refusal ledger has
+ * retired for this run is left out of the list entirely: two 429s already proved it is not
+ * answering, and dialling it again would only spend a gateway call and a slice of the trial's
+ * wall time. The order is a function of the brief and the gateway answers so far only, so it
+ * is identical on a live pass and its replay.
  */
 function candidatesFor(requires: Requirement): ModelRow[] {
   const leadId = requires.json === true ? LEAD_JSON_MODEL : LEAD_GENERAL_MODEL;
   const ranked = freeModels()
     .map((m, i) => ({ m, briefIndex: i }))
-    .filter((x) => meetsRequirements(requires, capabilitiesOf(x.m)) && !cooledDown429.has(x.m.id));
+    .filter((x) => meetsRequirements(requires, capabilitiesOf(x.m)) && !isRetired(x.m.id));
   const orderOf = (id: string): number => (id === leadId ? 0 : id === LAST_RESORT_MODEL ? 2 : 1);
   ranked.sort(
     (a, b) =>
@@ -1201,7 +1295,8 @@ async function dial(model: string, body: Json): Promise<DialResult> {
 
 /**
  * One candidate's dial, with one second chance for the lead model on a 429: a burst limit may
- * clear within seconds, and the lead model is worth one retry. Every refusal is recorded for the
+ * clear within seconds, and the lead model is worth one retry. Every refusal, first try or
+ * retry, is filed in the refusal ledger, so a model that keeps refusing leaves a readable
  * trail. The retry decision depends only on the gateway's answer, never on the clock, so a live
  * pass and its replay take it identically.
  */
@@ -1215,7 +1310,7 @@ async function attemptModel(
   if (attempt.ok && attempt.response !== null) return { model: candidate.id, response: attempt.response };
   if (attempt.failure !== null) {
     failures.push(attempt.failure);
-    noteRefusal(attempt.failure);
+    recordRefusal(attempt.failure);
   }
   if (retryOnce && attempt.failure !== null && attempt.failure.status === 429) {
     await sleep(LEAD_RETRY_DELAY_MS);
@@ -1223,7 +1318,7 @@ async function attemptModel(
     if (attempt.ok && attempt.response !== null) return { model: candidate.id, response: attempt.response };
     if (attempt.failure !== null) {
       failures.push(attempt.failure);
-      noteRefusal(attempt.failure);
+      recordRefusal(attempt.failure);
     }
   }
   return null;
@@ -1237,6 +1332,88 @@ interface VerifiedServe {
   /** A buffered stream, when the prompt was streaming. */
   buffered: BufferedStream | null;
 }
+
+/** One prompt's outcome, as the serve trail remembers it. */
+interface ServeRecord {
+  /** The model that answered, or null when every candidate refused. */
+  model: string | null;
+  /** How many refusals had piled up before this prompt was served. */
+  refusals: number;
+  /** Whether the answer that was served carried the prompt's token. */
+  tokenVerified: boolean;
+  /** Whether the prompt asked for a stream. */
+  streamed: boolean;
+}
+
+/** Every prompt this run has served, in the order the prompts arrived. */
+const serveTrail: ServeRecord[] = [];
+
+/**
+ * Append one prompt's outcome to the trail. A served prompt records the model that answered
+ * it and whether that answer was token-verified; an unserved prompt records a null model, so
+ * the trail still shows the prompt happened and nothing answered it. The trail is diagnostics
+ * only: nothing in routing or serving reads it back, so it cannot change a live pass or its
+ * replay.
+ */
+function recordServe(model: string | null, refusals: number, tokenVerified: boolean, streamed: boolean): void {
+  serveTrail.push({ model, refusals, tokenVerified, streamed });
+}
+
+/**
+ * One line summing up the whole trail: how many prompts were served out of how many arrived,
+ * how many of those answers were token-verified, how many streamed, how many refusals the run
+ * saw in total, and how many prompts each model served. No model served anything, one plain line.
+ */
+function serveSummaryLine(): string {
+  const served = serveTrail.filter((r) => r.model !== null);
+  const verified = served.filter((r) => r.tokenVerified).length;
+  const streamed = served.filter((r) => r.streamed).length;
+  const refusals = serveTrail.reduce((sum, r) => sum + r.refusals, 0);
+  const byModel = new Map<string, number>();
+  for (const r of served) {
+    const id = r.model ?? 'none';
+    byModel.set(id, (byModel.get(id) ?? 0) + 1);
+  }
+  const models = [...byModel.entries()].map(([m, n]) => `${m}x${n}`).join(', ');
+  return `serve summary: ${served.length}/${serveTrail.length} prompts served (${verified} token-verified, ${streamed} streamed), ${refusals} refusals seen, models: ${models === '' ? 'none' : models}`;
+}
+
+/**
+ * The whole trail as one line, one segment per prompt: the serving model (or "unserved"),
+ * the refusals that came before it, and a letter for token-verified (v) or fallback (f) and
+ * for streamed (s) or plain (p). A three-prompt run reads like
+ * "trail: super-vlx0:v/p | ultravx1:v/p | gemmax2:f/s". Empty trail, one plain line.
+ */
+function trailDigest(): string {
+  if (serveTrail.length === 0) return 'trail: no prompts served yet';
+  const segments = serveTrail.map((r) => {
+    const id = r.model ?? 'unserved';
+    const verified = r.tokenVerified ? 'v' : 'f';
+    const streamed = r.streamed ? 's' : 'p';
+    return `${id}x${r.refusals}:${verified}/${streamed}`;
+  });
+  return `trail: ${segments.join(' | ')}`;
+}
+
+/**
+ * Log the trail summary when the run ends, together with the trail digest and the ledger
+ * digest when any model stands retired. Nothing to log when no prompt ever arrived.
+ */
+function logServeSummary(): void {
+  if (serveTrail.length === 0) return;
+  log(serveSummaryLine());
+  log(trailDigest());
+  logLedgerIfRetired();
+}
+
+/**
+ * How one prompt is served, step by step: the candidates arrive in dial order from
+ * candidatesFor; each is dialled once, the lead once more on a 429; a refusal is filed in
+ * the ledger and in the prompt's failure list; an answer is kept only when its body carries
+ * the prompt's token, otherwise the best unverified answer is remembered as a fallback; a
+ * stream is buffered whole before the token check runs, so nothing unproven is ever relayed.
+ * When every candidate refused, the prompt goes unserved and the trail records a null model.
+ */
 
 /**
  * Dial the candidates in order until one answers with the prompt's token in its body: each
@@ -1269,7 +1446,9 @@ async function serveVerified(
       }
       if (token === null || buffered.text.includes(token) || buffered.toolArgs.includes(token)) {
         if (failures.length > 0) log(`served by ${candidate.id} after ${failures.length} refusal(s)`);
-        return { model: candidate.id, failures: failures.slice(), answer: null, buffered };
+        const outcome = { model: candidate.id, failures: failures.slice(), answer: null, buffered };
+        recordServe(outcome.model, outcome.failures.length, true, true);
+        return outcome;
       }
       if (bestUnverified === null) {
         bestUnverified = { model: candidate.id, failures: failures.slice(), answer: null, buffered };
@@ -1285,12 +1464,15 @@ async function serveVerified(
     if (!isRecord(answer)) continue;
     if (token === null || openAIAnswerText(answer).includes(token)) {
       if (failures.length > 0) log(`served by ${candidate.id} after ${failures.length} refusal(s)`);
-      return { model: candidate.id, failures: failures.slice(), answer, buffered: null };
+      const outcome = { model: candidate.id, failures: failures.slice(), answer, buffered: null };
+      recordServe(outcome.model, outcome.failures.length, true, false);
+      return outcome;
     }
     if (bestUnverified === null) {
       bestUnverified = { model: candidate.id, failures: failures.slice(), answer, buffered: null };
     }
   }
+  recordServe(bestUnverified?.model ?? null, failures.length, false, stream);
   return bestUnverified;
 }
 
@@ -1301,7 +1483,14 @@ function models(req: IncomingMessage, res: ServerResponse): void {
   else sendJson(res, 200, openAIModelList(list));
 }
 
-/** POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it. */
+/**
+ * POST /v1/chat/completions: an OpenAI-shaped client, answered by the best free model that meets it.
+ * The request's requirements pick the candidates, serveVerified dials them until one answers
+ * with the prompt's token, and the answer goes back shaped exactly as the provider's own
+ * answer was — same model id, same content, same usage where the provider sent one — with a
+ * header carrying the failures that came before it. A request no free model can meet, or one
+ * every model refused, is answered with an error, never with an empty success.
+ */
 async function chat(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const body = await readJson(req);
   if (body === null) return sendError(res, 'openai', 400, 'invalid_request_error', 'the request body is not one JSON object');
@@ -1414,6 +1603,15 @@ async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> 
 /* ------------------------------------------------------------------ */
 /* main                                                                */
 /* ------------------------------------------------------------------ */
+
+/**
+ * A run's lifecycle, end to end: the --list flag prints the catalog and leaves; otherwise the
+ * server registers with the env, serves prompts on both wires until the env says the work is
+ * done, then logs the serve trail and the refusal ledger and exits. Every prompt in between
+ * follows the same path — candidates, dials, token verification, one answer back — and every
+ * refusal along the way is filed in the ledger, so the trail and the digest at the end tell
+ * the whole story of the run: which models answered, which ones dropped out, and why.
+ */
 
 interface EnvRegistration {
   url: string;
@@ -1568,6 +1766,7 @@ async function main(): Promise<number> {
       return false;
     });
     if (done) {
+      logServeSummary();
       log('work is done, exiting');
       await new Promise<void>((resolve) => server.close(() => resolve()));
       return 0;
