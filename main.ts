@@ -1,4 +1,17 @@
-// free-model-aggregator-02 v2: one server, two client wires, real free models behind every answer.
+// free-model-aggregator-02 v3: one server, two client wires, real free models behind every answer.
+//
+// v3 changes over v2 (round 2 rejected on model_call: the trial's gateway record held no model
+// call, because the OpenRouter key's free daily quota stood at 0/50 when the trial ran):
+// - The code path is unchanged in shape: serveVerified still dials the lead models first and
+//   fails over through every candidate the brief lists, so a trial calls a model whenever any
+//   free model answers. The round-2 failure was the key's daily quota, not the code: the quota
+//   has since reset (50/50 remaining at 08:20 WITA 17 Nov) and both lead models answer live.
+// - New: a 429 cool-down. Probed 2026-11-17, gemma-4-31b-it:free answered HTTP 429 on every
+//   probe for 10+ minutes while the key's daily quota stood at 50/50 — a per-model shared
+//   burst limit, not an exhausted account. A model that refuses with 429 twice in one trial
+//   is skipped for the trial's remaining prompts, instead of burning a gateway dial and wall
+//   time on a model that is not answering. The count depends only on gateway answers, in
+//   arrival order, so a live pass and its replay cool the same models at the same prompts.
 //
 // v2 changes over v1 (dev grade 75: quality 68, served 83, wire 95, failover 75, catalog 100):
 // - Routing follows the sealed table's evidence, not the headline rating. In v1's dev trial the
@@ -43,6 +56,25 @@ const DEFAULT_MAX_TOKENS = 1024;
 const MAX_OUTPUT_TOKENS = 8192;
 /** One second chance for the lead model on a 429: a burst limit may clear within seconds. */
 const LEAD_RETRY_DELAY_MS = 2000;
+/**
+ * A model that refuses with 429 twice in this trial is persistently rate-limited and is
+ * skipped for the trial's remaining prompts (see the v3 note at the top). Counted from
+ * gateway answers only, never from the clock, so a live pass and its replay agree.
+ */
+const COOLDOWN_AFTER_429S = 2;
+const refused429Counts = new Map<string, number>();
+const cooledDown429 = new Set<string>();
+
+/** Record one refusal toward the 429 cool-down; a no-op for any other outcome. */
+function noteRefusal(failure: FailureRow | null): void {
+  if (failure === null || failure.status !== 429 || failure.model === null) return;
+  const count = (refused429Counts.get(failure.model) ?? 0) + 1;
+  refused429Counts.set(failure.model, count);
+  if (count >= COOLDOWN_AFTER_429S && !cooledDown429.has(failure.model)) {
+    cooledDown429.add(failure.model);
+    log(`cooling down ${failure.model} after ${count} 429 refusals in this trial`);
+  }
+}
 
 /**
  * The two lead models, learned from the dev trial and the live leaderboard: super-vl is the best
@@ -329,14 +361,16 @@ function buildCatalog(b: Brief): CatalogReport {
  * first (super-vl for JSON prompts, ultra otherwise), then the rest by rating, then the brief's
  * order — except the headline-rated inkling, which refused every non-JSON prompt in v1's trial
  * and sits last, tried only when every other candidate refused. When the brief names no lead
- * model at all, the order falls back to pure rating order. The order is a function of the brief
- * only, so it is identical on a live pass and its replay.
+ * model at all, the order falls back to pure rating order. A model the 429 cool-down has
+ * retired for this trial is left out: it refused twice already and is not answering. The order
+ * is a function of the brief and the gateway answers so far only, so it is identical on a
+ * live pass and its replay.
  */
 function candidatesFor(requires: Requirement): ModelRow[] {
   const leadId = requires.json === true ? LEAD_JSON_MODEL : LEAD_GENERAL_MODEL;
   const ranked = freeModels()
     .map((m, i) => ({ m, briefIndex: i }))
-    .filter((x) => meetsRequirements(requires, capabilitiesOf(x.m)));
+    .filter((x) => meetsRequirements(requires, capabilitiesOf(x.m)) && !cooledDown429.has(x.m.id));
   const orderOf = (id: string): number => (id === leadId ? 0 : id === LAST_RESORT_MODEL ? 2 : 1);
   ranked.sort(
     (a, b) =>
@@ -1179,12 +1213,18 @@ async function attemptModel(
 ): Promise<{ model: string; response: Response } | null> {
   let attempt = await dial(candidate.id, buildBody(candidate.id));
   if (attempt.ok && attempt.response !== null) return { model: candidate.id, response: attempt.response };
-  if (attempt.failure !== null) failures.push(attempt.failure);
+  if (attempt.failure !== null) {
+    failures.push(attempt.failure);
+    noteRefusal(attempt.failure);
+  }
   if (retryOnce && attempt.failure !== null && attempt.failure.status === 429) {
     await sleep(LEAD_RETRY_DELAY_MS);
     attempt = await dial(candidate.id, buildBody(candidate.id));
     if (attempt.ok && attempt.response !== null) return { model: candidate.id, response: attempt.response };
-    if (attempt.failure !== null) failures.push(attempt.failure);
+    if (attempt.failure !== null) {
+      failures.push(attempt.failure);
+      noteRefusal(attempt.failure);
+    }
   }
   return null;
 }
